@@ -1,0 +1,532 @@
+name: Cross-Platform Build, Test and Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag name (e.g. v1.0.0). Leave empty to build/test without releasing.'
+        required: false
+        default: ''
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ==================== LICENSES ====================
+  generate-licenses:
+    name: Generate Third-Party Licenses
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-about
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+
+      - name: Generate license file
+        run: |
+          mkdir -p licenses
+          cargo about generate about.hbs > licenses/THIRD_PARTY_LICENSES.html
+          cp README.md NOTICE.md licenses/ 2>/dev/null || true
+
+      - name: Upload License Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: licenses-files
+          path: licenses/
+
+  # ==================== WINDOWS MSVC ====================
+  build-windows-msvc:
+    name: Build - Windows MSVC (x86_64 & ARM64)
+    needs: generate-licenses
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc, aarch64-pc-windows-msvc
+
+      - name: Install dependencies via vcpkg
+        run: |
+          choco install pkgconfiglite -y
+          vcpkg install "soxr:x64-windows-static" "portaudio:x64-windows-static" "soxr:arm64-windows-static" "portaudio:arm64-windows-static"
+
+      - name: Build x86_64
+        shell: bash
+        run: |
+          PC_DIR="C:/vcpkg/installed/x64-windows-static/lib/pkgconfig"
+          mkdir -p "$PC_DIR"
+          printf "prefix=C:/vcpkg/installed/x64-windows-static\nexec_prefix=\${prefix}\nlibdir=\${prefix}/lib\nincludedir=\${prefix}/include\n\nName: soxr\nDescription: High quality one-dimensional sample-rate conversion library\nVersion: 0.1.3\nLibs: -L\${libdir} -lsoxr\nCflags: -I\${includedir}\n" > "$PC_DIR/soxr.pc"
+          export PKG_CONFIG_PATH="$PC_DIR"
+          export RUSTFLAGS="-L native=C:/vcpkg/installed/x64-windows-static/lib"
+          export LIB="C:\vcpkg\installed\x64-windows-static\lib;$LIB"
+          export PKG_CONFIG_ALL_STATIC="1"
+          cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Build ARM64
+        shell: bash
+        run: |
+          PC_DIR="C:/vcpkg/installed/arm64-windows-static/lib/pkgconfig"
+          mkdir -p "$PC_DIR"
+          printf "prefix=C:/vcpkg/installed/arm64-windows-static\nexec_prefix=\${prefix}\nlibdir=\${prefix}/lib\nincludedir=\${prefix}/include\n\nName: soxr\nDescription: High quality one-dimensional sample-rate conversion library\nVersion: 0.1.3\nLibs: -L\${libdir} -lsoxr\nCflags: -I\${includedir}\n" > "$PC_DIR/soxr.pc"
+          export PKG_CONFIG_PATH="$PC_DIR"
+          export RUSTFLAGS="-L native=C:/vcpkg/installed/arm64-windows-static/lib"
+          export LIB="C:\vcpkg\installed\arm64-windows-static\lib;$LIB"
+          export PKG_CONFIG_ALL_STATIC="1"
+          export PKG_CONFIG_ALLOW_CROSS=1
+          cargo build --release --target aarch64-pc-windows-msvc
+
+      - name: Download License Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: licenses-files
+          path: dist-licenses
+
+      - name: Package x86_64
+        shell: powershell
+        run: |
+          mkdir dist-x86_64
+          cp target/x86_64-pc-windows-msvc/release/loop-ogg.exe dist-x86_64/
+          cp dist-licenses/* dist-x86_64/
+          Compress-Archive -Path dist-x86_64/* -DestinationPath loop-ogg-windows-x86_64-msvc.zip
+
+      - name: Package ARM64
+        shell: powershell
+        run: |
+          mkdir dist-arm64
+          cp target/aarch64-pc-windows-msvc/release/loop-ogg.exe dist-arm64/
+          cp dist-licenses/* dist-arm64/
+          Compress-Archive -Path dist-arm64/* -DestinationPath loop-ogg-windows-arm64-msvc.zip
+
+      - name: Upload x86_64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loop-ogg-windows-x86_64-msvc.zip
+          path: loop-ogg-windows-x86_64-msvc.zip
+
+      - name: Upload ARM64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loop-ogg-windows-arm64-msvc.zip
+          path: loop-ogg-windows-arm64-msvc.zip
+
+  test-windows-msvc-x86_64:
+    name: Test - Windows MSVC x86_64 (Native Runner)
+    needs: build-windows-msvc
+    runs-on: windows-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: loop-ogg-windows-x86_64-msvc.zip
+
+      - name: Test Executable
+        shell: powershell
+        run: |
+          Expand-Archive -Path loop-ogg-windows-x86_64-msvc.zip -DestinationPath test_dir
+          cd test_dir
+          .\loop-ogg.exe --version
+
+  # ==================== WINDOWS MINGW ====================
+  build-windows-mingw:
+    name: Build - Windows MinGW-w64 UCRT64 (x86_64)
+    needs: generate-licenses
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-libsoxr
+            mingw-w64-ucrt-x86_64-portaudio
+            mingw-w64-ucrt-x86_64-rust
+            zip
+
+      - name: Build x86_64
+        run: cargo build --release --target x86_64-pc-windows-gnu
+
+      - name: Download License Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: licenses-files
+          path: dist-licenses
+
+      - name: Package x86_64
+        run: |
+          mkdir -p dist-x86_64
+          cp target/x86_64-pc-windows-gnu/release/loop-ogg.exe dist-x86_64/
+          for dll in $(ldd target/x86_64-pc-windows-gnu/release/loop-ogg.exe | grep /ucrt64/bin | awk '{print $3}'); do
+            cp "$dll" dist-x86_64/
+          done
+          cp dist-licenses/* dist-x86_64/
+          cd dist-x86_64
+          zip -r "../loop-ogg-windows-x86_64-mingw-ucrt64.zip" *
+
+      - name: Upload x86_64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loop-ogg-windows-x86_64-mingw-ucrt64.zip
+          path: loop-ogg-windows-x86_64-mingw-ucrt64.zip
+
+  test-windows-mingw-x86_64:
+    name: Test - Windows MinGW x86_64 (Native Runner)
+    needs: build-windows-mingw
+    runs-on: windows-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: loop-ogg-windows-x86_64-mingw-ucrt64.zip
+
+      - name: Test Executable
+        shell: powershell
+        run: |
+          Expand-Archive -Path loop-ogg-windows-x86_64-mingw-ucrt64.zip -DestinationPath test_dir
+          cd test_dir
+          .\loop-ogg.exe --version
+
+  # ==================== LINUX ====================
+  build-linux-x86_64:
+    name: Build - Linux (x86_64)
+    needs: generate-licenses
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsoxr-dev portaudio19-dev libasound2-dev pkg-config zip
+
+      - name: Build loop-ogg
+        run: cargo build --release
+        env:
+          PKG_CONFIG_ALL_STATIC: "1"
+
+      - name: Prepare dist directory
+        run: |
+          mkdir -p dist
+          cp target/release/loop-ogg dist/
+
+          while true; do
+            NEW_COPIED=0
+            FOR_SCAN=$(find dist/ -type f \( -name "loop-ogg" -o -name "*.so*" \))
+            
+            for file in $FOR_SCAN; do
+              for so_path in $(ldd "$file" 2>/dev/null | grep '=> /' | awk '{print $3}'); do
+                so_name=$(basename "$so_path")
+                if ! echo "$so_name" | grep -qE "^(libc\.so|libm\.so|libpthread\.so|libdl\.so|librt\.so|libgcc_s\.so|ld-linux)"; then
+                  if [ ! -f "dist/$so_name" ]; then
+                    cp -L "$so_path" "dist/$so_name"
+                    NEW_COPIED=1
+                  fi
+                fi
+              done
+            done
+            if [ $NEW_COPIED -eq 0 ]; then break; fi
+          done
+
+      - name: Download License Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: licenses-files
+          path: dist
+
+      - name: Archive artifacts
+        run: |
+          cd dist
+          tar -czvf "../loop-ogg-linux-x86_64.tar.gz" *
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loop-ogg-linux-x86_64.tar.gz
+          path: loop-ogg-linux-x86_64.tar.gz
+
+  test-linux-x86_64:
+    name: Test - Linux x86_64 (Native Runner)
+    needs: build-linux-x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: loop-ogg-linux-x86_64.tar.gz
+
+      - name: Test Executable
+        run: |
+          mkdir test_dir
+          tar -xzvf loop-ogg-linux-x86_64.tar.gz -C test_dir
+          cd test_dir
+          chmod +x loop-ogg
+          LD_LIBRARY_PATH=. ./loop-ogg --version
+
+  build-linux-arm64:
+    name: Build - Linux (ARM64)
+    needs: generate-licenses
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsoxr-dev portaudio19-dev libasound2-dev pkg-config zip
+
+      - name: Build loop-ogg
+        run: cargo build --release
+        env:
+          PKG_CONFIG_ALL_STATIC: "1"
+
+      - name: Prepare dist directory
+        run: |
+          mkdir -p dist
+          cp target/release/loop-ogg dist/
+
+          while true; do
+            NEW_COPIED=0
+            FOR_SCAN=$(find dist/ -type f \( -name "loop-ogg" -o -name "*.so*" \))
+            
+            for file in $FOR_SCAN; do
+              for so_path in $(ldd "$file" 2>/dev/null | grep '=> /' | awk '{print $3}'); do
+                so_name=$(basename "$so_path")
+                if ! echo "$so_name" | grep -qE "^(libc\.so|libm\.so|libpthread\.so|libdl\.so|librt\.so|libgcc_s\.so|ld-linux)"; then
+                  if [ ! -f "dist/$so_name" ]; then
+                    cp -L "$so_path" "dist/$so_name"
+                    NEW_COPIED=1
+                  fi
+                fi
+              done
+            done
+            if [ $NEW_COPIED -eq 0 ]; then break; fi
+          done
+
+      - name: Download License Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: licenses-files
+          path: dist
+
+      - name: Archive artifacts
+        run: |
+          cd dist
+          tar -czvf "../loop-ogg-linux-arm64.tar.gz" *
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loop-ogg-linux-arm64.tar.gz
+          path: loop-ogg-linux-arm64.tar.gz
+
+  test-linux-arm64:
+    name: Test - Linux ARM64 (Native Hardware Runner)
+    needs: build-linux-arm64
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: loop-ogg-linux-arm64.tar.gz
+
+      - name: Test Executable
+        run: |
+          mkdir test_dir
+          tar -xzvf loop-ogg-linux-arm64.tar.gz -C test_dir
+          cd test_dir
+          chmod +x loop-ogg
+          LD_LIBRARY_PATH=. ./loop-ogg --version
+
+  # ==================== MACOS ====================
+  build-macos-arm64:
+    name: Build - macOS (ARM64)
+    needs: generate-licenses
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: brew install libsoxr portaudio pkg-config
+
+      - name: Build loop-ogg
+        run: cargo build --release
+        env:
+          PKG_CONFIG_ALL_STATIC: "1"
+
+      - name: Prepare dist directory
+        run: |
+          mkdir -p dist
+          cp target/release/loop-ogg dist/
+          for dylib in $(otool -L target/release/loop-ogg | grep "/opt/homebrew" | awk '{print $1}'); do
+            filename=$(basename "$dylib")
+            cp "$dylib" dist/
+            install_name_tool -change "$dylib" "@executable_path/$filename" dist/loop-ogg
+          done
+
+      - name: Download License Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: licenses-files
+          path: dist
+
+      - name: Archive artifacts
+        run: |
+          cd dist
+          tar -czvf "../loop-ogg-macos-arm64.tar.gz" *
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loop-ogg-macos-arm64.tar.gz
+          path: loop-ogg-macos-arm64.tar.gz
+
+  test-macos-arm64:
+    name: Test - macOS ARM64 (Native Hardware Runner)
+    needs: build-macos-arm64
+    runs-on: macos-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: loop-ogg-macos-arm64.tar.gz
+
+      - name: Test Executable
+        run: |
+          mkdir test_dir
+          tar -xzvf loop-ogg-macos-arm64.tar.gz -C test_dir
+          cd test_dir
+          chmod +x loop-ogg
+          ./loop-ogg --version
+
+  build-macos-x86_64:
+    name: Build - macOS (x86_64)
+    needs: generate-licenses
+    runs-on: macos-15-intel
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: brew install libsoxr portaudio pkg-config
+
+      - name: Build loop-ogg
+        run: cargo build --release
+        env:
+          PKG_CONFIG_ALL_STATIC: "1"
+
+      - name: Prepare dist directory
+        run: |
+          mkdir -p dist
+          cp target/release/loop-ogg dist/
+          for dylib in $(otool -L target/release/loop-ogg | grep "/usr/local" | awk '{print $1}'); do
+            filename=$(basename "$dylib")
+            cp "$dylib" dist/
+            install_name_tool -change "$dylib" "@executable_path/$filename" dist/loop-ogg
+          done
+
+      - name: Download License Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: licenses-files
+          path: dist
+
+      - name: Archive artifacts
+        run: |
+          cd dist
+          tar -czvf "../loop-ogg-macos-x86_64.tar.gz" *
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: loop-ogg-macos-x86_64.tar.gz
+          path: loop-ogg-macos-x86_64.tar.gz
+
+  test-macos-x86_64:
+    name: Test - macOS x86_64 (Native Hardware Runner)
+    needs: build-macos-x86_64
+    runs-on: macos-15-intel
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: loop-ogg-macos-x86_64.tar.gz
+
+      - name: Test Executable
+        run: |
+          mkdir test_dir
+          tar -xzvf loop-ogg-macos-x86_64.tar.gz -C test_dir
+          cd test_dir
+          chmod +x loop-ogg
+          ./loop-ogg --version
+
+  # ==================== RELEASE ====================
+  release:
+    name: Create GitHub Release
+    needs:
+      - test-windows-msvc-x86_64
+      - test-windows-mingw-x86_64
+      - test-linux-x86_64
+      - test-linux-arm64
+      - test-macos-arm64
+      - test-macos-x86_64
+    if: inputs.release_tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: loop-ogg-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Generate Checksums
+        run: |
+          cd artifacts
+          sha256sum loop-ogg-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: |
+            artifacts/loop-ogg-*
+            artifacts/SHA256SUMS.txt
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
