@@ -135,6 +135,23 @@ jobs:
           cd test_dir
           .\loop-ogg.exe --version
 
+  test-windows-msvc-arm64:
+    name: Test - Windows MSVC ARM64 (Native Runner)
+    needs: build-windows-msvc
+    runs-on: windows-11-arm
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: loop-ogg-windows-arm64-msvc.zip
+
+      - name: Test Executable
+        shell: powershell
+        run: |
+          Expand-Archive -Path loop-ogg-windows-arm64-msvc.zip -DestinationPath test_dir
+          cd test_dir
+          .\loop-ogg.exe --version
+
   # ==================== WINDOWS MINGW ====================
   build-windows-mingw:
     name: Build - Windows MinGW-w64 UCRT64 (x86_64)
@@ -496,6 +513,7 @@ jobs:
     name: Create GitHub Release
     needs:
       - test-windows-msvc-x86_64
+      - test-windows-msvc-arm64
       - test-windows-mingw-x86_64
       - test-linux-x86_64
       - test-linux-arm64
